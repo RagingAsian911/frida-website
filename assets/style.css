@@ -1,0 +1,14 @@
+body {
+  background: black;
+  color: white;
+  font-family: sans-serif;
+  padding: 2rem;
+}
+input, button {
+  margin-top: 1rem;
+  padding: 0.5rem;
+}
+#signal-feed {
+  margin-top: 2rem;
+  color: neonpink;
+}
