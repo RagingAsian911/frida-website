@@ -107,3 +107,13 @@ overview: true
 <section id="signal-feed"></section>
 <link rel="stylesheet" href="assets/style.css">
 <script src="assets/script.js" defer></script>
+<form id="talent-intake" onsubmit="submitTalent(event)">
+  <input name="name" placeholder="Name">
+  <input name="tagline" placeholder="Tagline">
+  <input name="image_url" placeholder="Image URL">
+  <select name="tier">
+    <option value="subscriber">Subscriber</option>
+    <option value="oracle">Oracle</option>
+  </select>
+  <button type="submit">Submit</button>
+</form>
