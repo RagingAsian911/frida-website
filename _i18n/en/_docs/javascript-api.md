@@ -23,6 +23,7 @@ Clone **[this repo](https://github.com/oleavr/frida-agent-example)** to get star
     1. [Memory](#memory)
     1. [MemoryAccessMonitor](#memoryaccessmonitor)
     1. [CModule](#cmodule)
+    1. [RustModule](#rustmodule)
     1. [ApiResolver](#apiresolver)
     1. [DebugSymbol](#debugsymbol)
     1. [Kernel](#kernel)
@@ -78,6 +79,16 @@ Clone **[this repo](https://github.com/oleavr/frida-agent-example)** to get star
     1. [Communication between host and injected process](#communication-between-host-and-injected-process)
     1. [Timing events](#timing-events)
     1. [Garbage collection](#garbage-collection)
+    1. [Worker](#worker)
+    1. [Cloak](#cloak)
+    1. [Profiler](#profiler)
+    1. [Sampler](#sampler)
+    1. [CycleSampler](#cycle-sampler)
+    1. [BusyCycleSampler](#busy-cycle-sampler)
+    1. [WallClockSampler](#wall-clock-sampler)
+    1. [UserTimeSampler](#user-time-sampler)
+    1. [MallocCountSampler](#malloc-count-sampler)
+    1. [CallCountSampler](#call-count-sampler)
 
 ---
 
@@ -96,6 +107,51 @@ Clone **[this repo](https://github.com/oleavr/frida-agent-example)** to get star
 
 +   `Script.runtime`: string property containing the runtime being used.
     Either `QJS` or `V8`.
+
++   `Script.evaluate(name, source)`: evaluates the given JavaScript string
+    `source` in the global scope, where `name` is a string specifying the
+    script's name, e.g. `/plugins/tty.js`. The provided name is a UNIX-style
+    virtual filesystem path used in future stack traces.
+    {: #script-evaluate}
+
+    Useful for agents that want to support loading user-provided scripts inside
+    their own script. The two benefits over simply using `eval()` is that the
+    script filename can be provided, and source maps are supported — both
+    inline and through
+    [`Script.registerSourceMap()`](#script-registersourcemap).
+
+    Returns the resulting value of the evaluated code.
+
++   `Script.load(name, source)`: compiles and evaluates the given JavaScript
+    string `source` as an ES module, where `name` is a string specifying the
+    module's name, e.g. `/plugins/screenshot.js`. The provided name is a
+    UNIX-style virtual filesystem path used in future stack traces, and is
+    visible to other modules, which may import it, either statically or
+    dynamically.
+
+    Useful for agents that want to support loading user-provided scripts inside
+    their own script. This API offers the same benefits over `eval()` as
+    [`Script.evaluate()`](#script-evaluate), in addition to encapsulating the
+    user-provided code in its own ES module. This means values may be exported,
+    and subsequently imported by other modules. The parent script may also
+    export values that can be imported from the loaded child script. This
+    requires that the parent uses the new ES module bundle format used by newer
+    versions of frida-compile.
+
+    Returns a *Promise* that resolves to the module's namespace object.
+
++   `Script.registerSourceMap(name, json)`: registers a source map for the
+    specified script `name`, given as a string with a UNIX-style virtual
+    filesystem path, e.g. `/plugins/screenshot.js`. The source map `json` is a
+    string containing the raw JSON representation of the source map.
+    {: #script-registersourcemap}
+
+    Should ideally be called before the given script gets loaded, so stack
+    traces created during load can make use of the source map.
+
++   `Script.nextTick(func[, ...params])`: runs `func` on the next tick, i.e.
+    when the current native thread exits the JavaScript runtime. Any additional
+    `params` are passed to it.
 
 +   `Script.pin()`: temporarily prevents the current script from being unloaded.
     This is reference-counted, so there must be one matching *unpin()* happening
@@ -141,8 +197,8 @@ Clone **[this repo](https://github.com/oleavr/frida-agent-example)** to get star
     or `arm64`
     {: #process-arch}
 
-+   `Process.platform`: property containing the string `windows`,
-    `darwin`, `linux` or `qnx`
++   `Process.platform`: property containing the string `windows`, `darwin`,
+    `linux`, `freebsd`, `qnx`, or `barebone`
 
 +   `Process.pageSize`: property containing the size of a virtual memory page
     (in bytes) as a number. This is used to make your scripts more portable.
@@ -177,16 +233,47 @@ Clone **[this repo](https://github.com/oleavr/frida-agent-example)** to get star
 
 +   `Process.getCurrentThreadId()`: get this thread's OS-specific id as a number
 
-+   `Process.enumerateThreads()`: enumerates all threads, returning an array of
-    objects containing the following properties:
++   `Process.enumerateThreads()`: enumerates running threads, returning an array
+    of **[Thread](#thread)** objects.
+    {: #process-enumeratethreads}
 
-    -   `id`: OS-specific id
-    -   `state`: string specifying either `running`, `stopped`, `waiting`,
-        `uninterruptible` or `halted`
-    -   `context`: object with the keys `pc` and `sp`, which are
-        **[NativePointer](#nativepointer)** objects specifying EIP/RIP/PC and
-        ESP/RSP/SP, respectively, for ia32/x64/arm. Other processor-specific keys
-        are also available, e.g. `eax`, `rax`, `r0`, `x0`, etc.
++   `Process.attachThreadObserver(callbacks)`: starts observing threads, calling
+     the provided `callbacks` as threads are added, removed, and renamed.
+
+    The `callbacks` argument is an object containing one or more of:
+
+    -   `onAdded(thread)`: callback function given the [`Thread`](#thread) that
+        was just added. Called with all existing threads right away, so the
+        initial state vs. updates can be managed easily without worrying about
+        race conditions. When called with a brand new thread, the call happens
+        synchronously from that new thread.
+
+    -   `onRemoved(thread)`: callback function given the [`Thread`](#thread)
+        that was just removed, i.e. is about to terminate. The call happens
+        synchronously from the thread that is about to terminate.
+
+    -   `onRenamed(thread, previousName)`: callback function given the
+        [`Thread`](#thread) that was just renamed, with its new `name` property,
+        and a second argument `previousName` that specifies its previous name.
+        The previous name is either a string, or `null` if the thread was
+        previously unnamed.
+
+    Note that the [`Thread`](#thread) objects lack the `state` and `context`
+    properties, as those are highly volatile in nature, and their changes are
+    not observed. Note that you can combine this API with [`Stalker`](#stalker)
+    to trace the execution of individual threads.
+
+    Returns an observer object that you can call `detach()` on.
+
++   `Process.runOnThread(id, callback)`: runs the JavaScript function `callback`
+    without any arguments, on the thread specified by `id`. Returns a *Promise*
+    that receives the value returned by your callback.
+
+    Must be used with extreme caution due to the thread potentially being
+    interrupted in non-reentrant code. For example, you could be interrupting it
+    while it's in the middle of some delicate code, holding a specific
+    non-recursive lock, which you then try to implicitly acquire again when you
+    call some function.
 
 +   `Process.findModuleByAddress(address)`,
     `Process.getModuleByAddress(address)`,
@@ -201,6 +288,24 @@ Clone **[this repo](https://github.com/oleavr/frida-agent-example)** to get star
 +   `Process.enumerateModules()`: enumerates modules loaded right now, returning
     an array of **[Module](#module)** objects.
     {: #process-enumeratemodules}
+
++   `Process.attachModuleObserver(callbacks)`: starts observing modules, calling
+     the provided `callbacks` as modules are added and removed.
+
+    The `callbacks` argument is an object containing one or more of:
+
+    -   `onAdded(module)`: callback function given the [`Module`](#module) that
+        was just added. Called with all existing modules right away, so the
+        initial state vs. updates can be managed easily without worrying about
+        race conditions. When called with a brand new module, the call happens
+        synchronously right after that module has been loaded, but before the
+        application has had a chance to use it. This means it's a good time to
+        apply your instrumentation, using e.g. [`Interceptor`](#interceptor).
+
+    -   `onRemoved(module)`: callback function given the [`Module`](#module)
+        that was just removed, i.e. unloaded.
+
+    Returns an observer object that you can call `detach()` on.
 
 +   `Process.findRangeByAddress(address)`, `getRangeByAddress(address)`:
     return an object with details about the range containing *address*. In the
@@ -277,6 +382,60 @@ Clone **[this repo](https://github.com/oleavr/frida-agent-example)** to get star
 
 ### Thread
 
+Objects returned by e.g.
+[`Process.enumerateThreads()`](#process-enumeratethreads).<br/><br/>
+
+-   `id`: OS-specific id, as a number
+
+-   `name`: string specifying the thread's name, if available
+
+-   `state`: snapshot of the thread's state, as a string specifying either
+    `running`, `stopped`, `waiting`, `uninterruptible`, or `halted`
+
+-   `context`: snapshot of CPU registers, as an object with the keys `pc` and
+    `sp`, which are **[NativePointer](#nativepointer)** objects specifying
+    EIP/RIP/PC and ESP/RSP/SP, respectively, for ia32/x64/arm. Other
+    processor-specific keys are also available, e.g. `eax`, `rax`, `r0`, `x0`,
+    etc.
+    {: #thread-context}
+
+-   `entrypoint`: where the thread started its execution, if applicable and
+    available. When present, it's an object containing:
+
+    -   `routine`: the thread's start routine, as a
+        [`NativePointer`](#nativepointer)
+
+    -   `parameter`: parameter passed to `routine`, if available, as a
+        [`NativePointer`](#nativepointer)
+
+-   `setHardwareBreakpoint(id, address)`: sets a hardware breakpoint, where `id`
+    is a number specifying the breakpoint ID, and `address` is a
+    [`NativePointer`](#nativepointer) specifying the address of the breakpoint.
+    Typically used in conjunction with
+    [`Process.setExceptionHandler()`](#process-setexceptionhandler) to handle
+    the raised exceptions.
+    {: #thread-sethardwarebreakpoint}
+
+-   `unsetHardwareBreakpoint(id)`: unsets a hardware breakpoint, where `id`
+    is a number specifying the breakpoint ID previously set by calling
+    [`setHardwareBreakpoint()`](#thread-sethardwarebreakpoint).
+
+-   `setHardwareWatchpoint(id, address, size, conditions)`: sets a harware
+    watchpoint, where `id` is a number specifying the watchpoint ID, `address`
+    is a [`NativePointer`](#nativepointer) specifying the address of the region
+    to be watched, `size` is a number specifying the size of that region, and
+    `conditions` is a string specifying either `r`, `w`, or `rw`. Here, `r`
+    means to watch for reads, `w` means to watch for writes, and `rw` means to
+    watch for both reads and writes.
+    Typically used in conjunction with
+    [`Process.setExceptionHandler()`](#process-setexceptionhandler) to handle
+    the raised exceptions.
+    {: #thread-sethardwarewatchpoint}
+
+-   `unsetHardwareWatchpoint(id)`: unsets a hardware watchpoint, where `id` is a
+    number specifying the watchpoint ID previously set by calling
+    [`setHardwareWatchpoint()`](#thread-sethardwarewatchpoint).
+
 +   `Thread.backtrace([context, backtracer])`: generate a backtrace for the
     current thread, returned as an array of [`NativePointer`](#nativepointer) objects.
     {: #thread-backtrace}
@@ -298,8 +457,8 @@ Clone **[this repo](https://github.com/oleavr/frida-agent-example)** to get star
     Frida.
 
 {% highlight js %}
-const f = Module.getExportByName('libcommonCrypto.dylib',
-    'CCCryptorCreate');
+const commonCrypto = Process.getModuleByName('libcommonCrypto.dylib');
+const f = commonCrypto.getExportByName('CCCryptorCreate');
 Interceptor.attach(f, {
   onEnter(args) {
     console.log('CCCryptorCreate called from:\n' +
@@ -324,6 +483,11 @@ Objects returned by e.g. [`Module.load()`](#module-load) and [`Process.enumerate
 -   `size`: size in bytes
 
 -   `path`: full filesystem path as a string
+
+-   `ensureInitialized()`: ensures that the module initializers have been run.
+    This is important during early instrumentation, i.e. run early in the
+    process lifetime, to be able to safely interact with APIs. One such use-case
+    is interacting with **[ObjC](#objc)** classes provided by a given module.
 
 -   `enumerateImports()`: enumerates imports of module, returning an array of
     objects containing the following properties:
@@ -404,37 +568,30 @@ Objects returned by e.g. [`Module.load()`](#module-load) and [`Process.enumerate
         -   reexport
         -   upward
 
--   `findExportByName(exportName)`,
-    `getExportByName(exportName)`: returns the absolute address of the export
-    named `exportName`. In the event that no such export could be found, the
-    *find*-prefixed function returns *null* whilst the *get*-prefixed function
-    throws an exception.
+-   `findExportByName(name)`,
+    `getExportByName(name)`: returns the absolute address of the export named
+    `name`. In the event that no such export could be found, the *find*-prefixed
+    function returns *null* whilst the *get*-prefixed function throws an
+    exception.
+    {: #module-getexportbyname}
+
+-   `findSymbolByName(name)`,
+    `getSymbolByName(name)`: returns the absolute address of the symbol named
+    `name`. In the event that no such symbol could be found, the *find*-prefixed
+    function returns *null* whilst the *get*-prefixed function throws an
+    exception.
 
 +   `Module.load(path)`: loads the specified module from the filesystem path
     and returns a [`Module`](#module) object. Throws an exception if the specified
     module cannot be loaded.
     {: #module-load}
 
-+   `Module.ensureInitialized(name)`: ensures that initializers of the specified
-    module have been run. This is important during early instrumentation, i.e.
-    code run early in the process lifetime, to be able to safely interact with
-    APIs. One such use-case is interacting with **[ObjC](#objc)** classes provided
-    by a given module.
-
-+   `Module.findBaseAddress(name)`,
-    `Module.getBaseAddress(name)`: returns the base address of the `name`
-    module. In the event that no such module could be found, the *find*-prefixed
-    function returns *null* whilst the *get*-prefixed function throws an
-    exception.
-
-+   `Module.findExportByName(moduleName|null, exportName)`,
-    `Module.getExportByName(moduleName|null, exportName)`: returns the absolute
-    address of the export named `exportName` in `moduleName`. If the module
-    isn't known you may pass `null` instead of its name, but this can be a
-    costly search and should be avoided. In the event that no such module or
-    export could be found, the *find*-prefixed function returns *null* whilst
-    the *get*-prefixed function throws an exception.
-    {: #module-getexportbyname}
++   `Module.findGlobalExportByName(name)`,
+    `Module.getGlobalExportByName(name)`: returns the absolute address of the
+    global export named `name`. This can be a costly search and should be
+    avoided. In the event that no such export could be found, the
+    *find*-prefixed function returns *null* whilst the *get*-prefixed function
+    throws an exception.
 
 
 ### ModuleMap
@@ -583,6 +740,11 @@ console.log('Memory.scanSync() result:\n' +
 Memory.protect(ptr('0x1234'), 4096, 'rw-');
 {% endhighlight %}
 
++   `Memory.queryProtection(address)`: determines the current protection of the
+    memory at `address`, specified as a **[NativePointer](#nativepointer)**.
+    Returns a page protection string of the same format as
+    [`Process.enumerateRanges()`](#process-enumerateranges).
+
 +   `Memory.patchCode(address, size, apply)`: safely modify `size` bytes at
     `address`, specified as a **[NativePointer](#nativepointer)**. The supplied
     JavaScript function `apply` gets called with a writable pointer where you must
@@ -596,7 +758,8 @@ Memory.protect(ptr('0x1234'), 4096, 'rw-');
     For example:
 
 {% highlight js %}
-const getLivesLeft = Module.getExportByName('game-engine.so', 'get_lives_left');
+const gameEngine = Process.getModuleByName('game-engine.so');
+const getLivesLeft = gameEngine.getExportByName('get_lives_left');
 const maxPatchSize = 64; // Do not write out of bounds, may be a temporary buffer!
 Memory.patchCode(getLivesLeft, maxPatchSize, code => {
   const cw = new X86Writer(code, { pc: getLivesLeft });
@@ -629,6 +792,7 @@ Memory.patchCode(getLivesLeft, maxPatchSize, code => {
 
     -   `onAccess(details)`: called synchronously with `details` object
         containing:
+        -   `threadId`: the ID of the thread performing the access, as a number.
         -   `operation`: the kind of operation that triggered the access, as a
             string specifying either `read`, `write`, or `execute`
         -   `from`: address of instruction performing the access as a
@@ -641,6 +805,9 @@ Memory.patchCode(getLivesLeft, maxPatchSize, code => {
         -   `pagesCompleted`: overall number of pages which have been accessed
             so far (and are no longer being monitored)
         -   `pagesTotal`: overall number of pages that were initially monitored
+        -   `context`: CPU registers, just like
+            [`Thread#context`](#thread-context). You may also update register
+            values by assigning to these keys.
 
 +   `MemoryAccessMonitor.disable()`: stop monitoring the remaining memory ranges
     passed to [`MemoryAccessMonitor.enable()`](#memoryaccessmonitor-enable).
@@ -781,6 +948,38 @@ More details on CModule can be found in the **[Frida 12.7 release notes]({{
 site.baseurl_root }}/news/2019/09/18/frida-12-7-released/)**.
 
 
+### RustModule
+
+Compiles Rust source code to machine code, straight to memory.
+
++   `new RustModule(code[, symbols, options])`: creates a new Rust module from
+    the provided `code`, a string containing the Rust source code to compile.
+    The Rust module gets mapped into memory and becomes fully accessible to
+    JavaScript.
+
+    Useful for implementing hot callbacks, e.g. for [Interceptor](#interceptor)
+    and [Stalker](#stalker), but also useful when needing to start new threads
+    in order to call functions in a tight loop, e.g. for fuzzing purposes.
+
+    Public functions are automatically exported as
+    [`NativePointer`](#nativepointer) properties. This means you can pass them
+    to Interceptor and Stalker, or call them using
+    [`NativeFunction`](#nativefunction). In such cases you typically want to
+    ensure they are marked `#[no_mangle]` and `extern "C"`.
+
+    In addition to Rust libraries, the code being mapped in can also communicate
+    with JavaScript through the `symbols` exposed to it. This object maps symbol
+    names to [`NativePointer`](#nativepointer) values. Declare them as
+    `extern "C"` in your Rust source code. This may for example be one or more
+    memory blocks allocated using `Memory.alloc()`, and/or
+    [`NativeCallback`](#nativecallback) values for receiving callbacks from the
+    Rust module.
+
+    The optional third argument, `options`, is an object that may be used to
+    specify which Cargo dependencies to use, e.g.:
+    `{ dependencies: ['base64 = "0.22.1"', 'anyhow = "1.0.97"'] }`.
+
+
 ### ApiResolver
 
 +   `new ApiResolver(type)`: create a new resolver of the given `type`, allowing
@@ -891,8 +1090,8 @@ const first = matches[0];
     with [`Thread.backtrace()`](#thread-backtrace):
 
 {% highlight js %}
-const f = Module.getExportByName('libcommonCrypto.dylib',
-    'CCCryptorCreate');
+const commonCrypto = Process.getModuleByName('libcommonCrypto.dylib');
+const f = commonCrypto.getExportByName('CCCryptorCreate');
 Interceptor.attach(f, {
   onEnter(args) {
     console.log('CCCryptorCreate called from:\n' +
@@ -1164,6 +1363,16 @@ Kernel.protect(UInt64('0x1234'), 4096, 'rw-');
     A JavaScript exception will be thrown if any of the bytes written to
     the address isn't writable.
 
+-   `readVolatile(length)`, `writeVolatile(bytes)`: just like
+    [`NativePointer#readByteArray`](#nativepointer-readbytearray) and
+    [`NativePointer#writeByteArray`](#nativepointer-writebytearray), but avoid
+    generating a native exception in case the memory is inaccessible. This means
+    that the memory access is slower, due to one or more system calls being
+    involved, but safe to use in situations where our native exception handling
+    fails or is unavailable, and bad access would end up crashing the process.
+    Use this API if you're dumping memory while application threads may be
+    running, or the pointer references memory that may no longer be accessible.
+
 -   `readCString([size = -1])`,
     `readUtf8String([size = -1])`,
     `readUtf16String([length = -1])`,
@@ -1301,6 +1510,8 @@ Kernel.protect(UInt64('0x1234'), 4096, 'rw-');
     -   `traps`: code traps to be enabled, as a string. Supported values are:
         -   default: **[Interceptor.attach()](#interceptor-attach)** callbacks will be
                      called if any hooks are triggered by a function call.
+        -   none: Prevents boths **[Interceptor](#interceptor)** and
+                  **[Stalker](#stalker)** from triggering.
         -   all: In addition to **[Interceptor](#interceptor)** callbacks, **[Stalker](#stalker)**
                  may also be temporarily reactivated for the duration of each function
                  call. This is useful for e.g. measuring code coverage while guiding a
@@ -1681,7 +1892,7 @@ smt.reset();
     of the function you would like to intercept calls to. Note that on 32-bit ARM this
     address must have its least significant bit set to 0 for ARM functions, and
     1 for Thumb functions. Frida takes care of this detail for you if you get
-    the address from a Frida API (for example [`Module.getExportByName()`](#module-getexportbyname)).
+    the address from a Frida API (for example [`Module#getExportByName()`](#module-getexportbyname)).
     {: #interceptor-attach}
 
     The `callbacks` argument is an object containing one or more of:
@@ -1731,7 +1942,8 @@ smt.reset();
     For example:
 
 {% highlight js %}
-Interceptor.attach(Module.getExportByName('libc.so', 'read'), {
+const libc = Process.getModuleByName('libc.so');
+Interceptor.attach(libc.getExportByName('read'), {
   onEnter(args) {
     this.fileDescriptor = args[0].toInt32();
   },
@@ -1764,7 +1976,7 @@ Interceptor.attach(Module.getExportByName('libc.so', 'read'), {
     For example:
 
 {% highlight js %}
-Interceptor.attach(Module.getExportByName(null, 'read'), {
+Interceptor.attach(Module.getGlobalExportByName('read'), {
   onEnter(args) {
     console.log('Context information:');
     console.log('Context  : ' + JSON.stringify(this.context));
@@ -1844,7 +2056,8 @@ Interceptor.attach(Module.getExportByName(null, 'read'), {
     Here's an example:
 
 {% highlight js %}
-const openPtr = Module.getExportByName('libc.so', 'open');
+const libc = Process.getModuleByName('libc.so');
+const openPtr = libc.getExportByName('open');
 const open = new NativeFunction(openPtr, 'int', ['pointer', 'int']);
 Interceptor.replace(openPtr, new NativeCallback((pathPtr, flags) => {
   const path = pathPtr.readUtf8String();
@@ -1854,6 +2067,12 @@ Interceptor.replace(openPtr, new NativeCallback((pathPtr, flags) => {
   return fd;
 }, 'int', ['pointer', 'int']));
 {% endhighlight %}
+
++   `Interceptor.replaceFast(target, replacement)`: like
+    [`replace()`](#interceptor-replace) except `target` is modified to vector
+    directly to your replacement, which means there is less overhead compared to
+    replace(). This also means that you need to use the returned pointer if you
+    want to call the original implementation.
 
 +   `Interceptor.revert(target)`: revert function at `target` to the previous
     implementation.
@@ -1971,6 +2190,8 @@ Stalker.follow(mainThread.id, {
   //      iterator.putCallout(onMatch);
   //
   //      iterator.putLabel('nope');
+  //
+  //      /* You may also use putChainingReturn() to insert an early return. */
   //    }
   //
   //    iterator.keep();
@@ -2169,6 +2390,21 @@ Stalker.follow(mainThread.id, {
 
 
 ### ObjC
+
+<div class="note">
+<h5>Moved</h5>
+<p markdown="1">
+    As of Frida 17, this runtime bridge is no longer baked into Frida's GumJS
+    runtime, and can be fetched by running: `npm install frida-objc-bridge`.
+    <br/>
+
+    Import it into your agent like this:<br/>
+    `import ObjC from 'frida-objc-bridge';`<br/>
+
+    For now this is not needed in scripts loaded by the Frida REPL, as well as
+    frida-trace.
+</p>
+</div>
 
 +   `ObjC.available`: a boolean specifying whether the current process has an
     Objective-C runtime loaded. Do not invoke any other `ObjC` properties or
@@ -2584,12 +2820,41 @@ function isAppModule(m) {
 
 ### Java
 
+<div class="note">
+<h5>Moved</h5>
+<p markdown="1">
+    As of Frida 17, this runtime bridge is no longer baked into Frida's GumJS
+    runtime, and can be fetched by running: `npm install frida-java-bridge`.
+    <br/>
+
+    Import it into your agent like this:<br/>
+    `import Java from 'frida-java-bridge';`<br/>
+
+    For now this is not needed in scripts loaded by the Frida REPL, as well as
+    frida-trace.
+</p>
+</div>
+
 +   `Java.available`: a boolean specifying whether the current process has the
     a Java VM loaded, i.e. Dalvik or ART. Do not invoke any other `Java`
     properties or methods unless this is the case.
 
 +   `Java.androidVersion`: a string specifying which version of Android we're
     running on.
+
++   `ACC_PUBLIC`,
+    `ACC_PRIVATE`,
+    `ACC_PROTECTED`,
+    `ACC_STATIC`,
+    `ACC_FINAL`,
+    `ACC_SYNCHRONIZED`,
+    `ACC_BRIDGE`,
+    `ACC_VARARGS`,
+    `ACC_NATIVE`,
+    `ACC_ABSTRACT`,
+    `ACC_STRICT`,
+    `ACC_SYNTHETIC`: method flag constants, each a number, to be used with e.g.
+    [`Java.backtrace()`](#java-backtrace).
 
 +   `Java.enumerateLoadedClasses(callbacks)`: enumerate classes loaded right
     now, where `callbacks` is an object specifying:
@@ -2782,6 +3047,34 @@ const JString = Java.use('java.lang.String');
 const str = JString.$new(Java.array('byte', [ 0x48, 0x65, 0x69 ]));
 {% endhighlight %}
 
++   `Java.backtrace([options])`: generates a backtrace for the current thread.
+    {: #java-backtrace}
+
+    The optional `options` argument is an object that may contain some of the
+    following keys:
+
+    -   `limit`: how many frames up the stack to walk, as a number.
+        Defaults to 16.
+
+    Returns an object with the following properties:
+
+    -   `id`: ID that can be used for deduplicating identical backtraces, as a
+        string.
+    -   `frames`: stack frames. An array of objects containing the following
+        properties:
+
+        -   `signature`: stack frame signature as a string, e.g.
+            `Landroid/os/Looper;,loopOnce,(Landroid/os/Looper;JI)Z`
+        -   `origin`: where the code is from, i.e. a string specifying a
+            filesystem path. On Android this is the path to the `.dex`.
+        -   `className`: class name that method belongs to, as a string, e.g.
+            `android.os.Looper`
+        -   `methodName`: method name as a string, e.g. `loopOnce`
+        -   `methodFlags`: method flags as a number, e.g.
+            `Java.ACC_PUBLIC | Java.ACC_STATIC`
+        -   `fileName`: source file name as a string, e.g. `Looper.java`
+        -   `lineNumber`: source line number as a number, e.g. `201`
+
 +   `Java.isMainThread()`: determine whether the caller is running on the main
     thread.
 
@@ -2925,7 +3218,7 @@ const MyWeirdTrustManager = Java.registerClass({
     Note that on 32-bit ARM this address must have its least significant bit
     set to 0 for ARM functions, and 1 for Thumb functions. Frida takes care
     of this detail for you if you get the address from a Frida API (for
-    example [`Module.getExportByName()`](#module-getexportbyname)).
+    example [`Module#getExportByName()`](#module-getexportbyname)).
 
     The object returned has the fields:
 
@@ -4146,6 +4439,7 @@ const MyWeirdTrustManager = Java.registerClass({
 
 ## Others
 
+
 ### Console
 
 +   `console.log(line)`, `console.warn(line)`, `console.error(line)`:
@@ -4160,6 +4454,7 @@ const MyWeirdTrustManager = Java.registerClass({
     Arguments that are **[ArrayBuffer](#arraybuffer)** objects will be substituted by
     the result of [`hexdump()`](#hexdump) with default options.
 
+
 ### Hexdump
 
 +   `hexdump(target[, options])`: generate a hexdump from the provided
@@ -4169,8 +4464,9 @@ const MyWeirdTrustManager = Java.registerClass({
     For example:
 
 {% highlight js %}
-const libc = Module.findBaseAddress('libc.so');
+const libc = Process.getModuleByName('libc.so').base;
 console.log(hexdump(libc, {
+  /* address: ptr('0x1000'), -- to override the base address */
   offset: 0,
   length: 64,
   header: true,
@@ -4186,6 +4482,7 @@ console.log(hexdump(libc, {
 00000030  1e 00 1d 00 06 00 00 00 34 00 00 00 34 00 00 00  ........4...4...
 {% endhighlight %}
 
+
 ### Shorthand
 
 +   `int64(v)`: short-hand for [`new Int64(v)`](#int64)
@@ -4195,6 +4492,7 @@ console.log(hexdump(libc, {
 +   `ptr(s)`: short-hand for [`new NativePointer(s)`](#nativepointer)
 
 +   `NULL`: short-hand for `ptr("0")`
+
 
 ### Communication between host and injected process
 
@@ -4320,6 +4618,7 @@ notifications that you can watch for as well on both the `script` and `session`.
 If you want to be notified when the target process exits, use
 `session.on('detached', your_function)`.
 
+
 ### Timing events
 
 +   `setTimeout(func, delay[, ...parameters])`: call `func` after `delay`
@@ -4341,10 +4640,12 @@ If you want to be notified when the target process exits, use
 
 +   `clearImmediate(id)`: cancel id returned by call to `setImmediate`.
 
+
 ### Garbage collection
 
 +   `gc()`: force garbage collection. Useful for testing, especially logic
     involving [`Script.bindWeak()`](#bindweak).
+
 
 ### Worker
 
@@ -4376,6 +4677,167 @@ to be handled in a timely manner.
 -   `exports`: magic proxy object for calling **[rpc.exports](#rpc-exports)**
     defined by the worker. Each function returns a *Promise*, which you may
     *await* inside an *async* function.
+
+
+### Cloak
+
+Keeps you from seeing yourself during process introspection.
+
+Introspection APIs such as
+[`Process.enumerateThreads()`](#process-enumeratethreads) ensure that cloaked
+resources are skipped, and things appear as if you were not inside the process
+being instrumented.
+
+Any resources created by Frida's runtime will be cloaked automatically. This
+means you typically only need to manage cloaked resources if you use an
+OS-specific API to create a given resource.
+
++   `Cloak.addThread(id)`: updates the registry of cloaked resources so the
+    given thread `id` becomes invisible to cloak-aware APIs, such as
+    [`Process.enumerateThreads()`](#process-enumeratethreads).
+
++   `Cloak.removeThread(id)`: updates the registry of cloaked resources so the
+    given thread `id` becomes visible to cloak-aware APIs, such as
+    [`Process.enumerateThreads()`](#process-enumeratethreads).
+
++   `Cloak.hasCurrentThread()`: returns a boolean indicating whether the current
+    thread is currently being cloaked.
+
++   `Cloak.hasThread(id)`: returns a boolean indicating whether the given thread
+    `id` is currently being cloaked.
+
++   `Cloak.addRange(range)`: updates the registry of cloaked resources so the
+    given memory `range` becomes invisible to cloak-aware APIs, such as
+    [`Process.enumerateRanges()`](#process-enumerateranges).
+    The provided `range` is an object with `base` and `size` properties – like
+    the properties in an object returned by e.g.
+    [`Process.getModuleByName()`](#process-getmodulebyname).
+    {: #cloak-addrange}
+
++   `Cloak.removeRange(range)`: updates the registry of cloaked resources so the
+    given memory `range` becomes visible to cloak-aware APIs, such as.
+    [`Process.enumerateRanges()`](#process-enumerateranges).
+    The provided `range` is an object with `base` and `size` properties – like
+    the properties in an object returned by e.g.
+    [`Process.getModuleByName()`](#process-getmodulebyname).
+
++   `Cloak.hasRangeContaining(address)`: returns a boolean indicating whether a
+    memory range containing `address` is currently cloaked, specified as a
+    [NativePointer](#nativepointer).
+
++   `Cloak.clipRange(range)`: determines how much of the given memory `range` is
+    currently visible. The provided `range` is an object with `base` and `size`
+    properties – like the properties in an object returned by e.g.
+    [`Process.getModuleByName()`](#process-getmodulebyname). Returns an array of
+    such objects, indicating the visible parts of `range`. Will return an empty
+    array if the entire range is cloaked, or `null` if it is entirely visible.
+
++   `Cloak.addFileDescriptor(fd)`: updates the registry of cloaked resources so
+    the given file descriptor `fd` becomes invisible to cloak-aware APIs.
+
++   `Cloak.removeFileDescriptor(fd)`: updates the registry of cloaked resources
+    so the given file descriptor  `fd` becomes visible to cloak-aware APIs.
+
++   `Cloak.hasFileDescriptor(fd)`: returns a boolean indicating whether the
+    given file descriptor `fd` is currently being cloaked.
+
+
+### Profiler
+
+Simple worst-case profiler built on top of `Interceptor`.
+
+Unlike a conventional profiler, which samples call stacks at a certain
+frequency, you decide the exact functions that you're interested in profiling.
+
+When any of those functions gets called, the profiler grabs a sample on entry,
+and another one upon return. It then subtracts the two, to compute how expensive
+the call was. If the resulting value is greater than what it's seen previously
+for the specific function, that value becomes its new worst-case.
+
+Whenever a new worst-case has been discovered, it isn't necessarily enough to
+know that most of the time/cycles/etc. was spent by a specific function. That
+function may only be slow with certain input arguments, for example.
+
+This is a situation where you can pass in a [`describe`](#profiler-describe)
+callback for the specific function. Your callback should capture relevant
+context from the argument list and/or other state, and return a string that
+describes the new worst-case that was just discovered.
+
+When you later decide to call `generateReport()`, you'll find your computed
+descriptions embedded in each worst-case entry.
+
++   `new Profiler()`: creates a Profiler.
+
+-   `instrument(functionAddress, sampler[, callbacks])`: starts instrumenting
+    the specified function, specified by the `functionAddress`
+    [`NativePointer`](#nativepointer), using [`sampler`](#sampler).
+
+    The optional `callbacks` argument is an object that may contain:
+
+    -   `describe(args)`: called synchronously when a new worst-case has been
+        discovered, and a description should be captured from the argument list
+        and/or other relevant state. The implementation must return a string
+        describing the argument list. For more details about `args` and how
+        `this` is bound, see Interceptor [`onEnter`](#interceptor-onenter).
+        {: #profiler-describe}
+
+-   `generateReport()`: generates an XML report from the live profiler state,
+    returned as a string. May be called at any point, and as many times as
+    desired.
+
+
+### Sampler
+
+-   `sample()`: retrieves a new sample, returned as a bigint. What it denotes
+    depends on the specific sampler.
+
+
+### CycleSampler
+
+Sampler that measures CPU cycles, e.g. using the RDTSC instruction on x86.
+
++   `new CycleSampler()`: creates a CycleSampler.
+
+
+### BusyCycleSampler
+
+Sampler that measures CPU cycles only spent by the current thread, e.g. using
+QueryThreadCycleTime() on Windows.
+
++   `new BusyCycleSampler()`: creates a BusyCycleSampler.
+
+
+### WallClockSampler
+
+Sampler that measures passage of time.
+
++   `new WallClockSampler()`: creates a WallClockSampler.
+
+
+### UserTimeSampler
+
+Sampler that measures time spent in user-space.
+
++   `new UserTimeSampler([threadId])`: creates a UserTimeSampler that samples
+    the thread specified by `threadId`, as a number, or the current thread if
+    omitted.
+
+
+### MallocCountSampler
+
+Sampler that counts the number of calls to malloc(), calloc(), and realloc().
+
++   `new MallocCountSampler()`: creates a MallocCountSampler.
+
+
+### CallCountSampler
+
+Sampler that counts the number of calls to functions of your choosing.
+
++   `new CallCountSampler(functions)`: creates a CallCountSampler that samples
+    the number of calls to `functions`, an array of
+    [`NativePointer`](#nativepointer) values specifying the functions to
+    count the number of calls to.
 
 
 [r2]: https://radare.org/r/

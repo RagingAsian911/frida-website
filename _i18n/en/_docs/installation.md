@@ -48,7 +48,7 @@ $ cp /bin/cat /tmp/cat
 $ /tmp/cat
 {% endhighlight %}
 
-In another terminal, make a file example.py with the following contents:
+In another terminal, make a file `example.py` with the following contents:
 
 {% highlight py %}
 import frida
