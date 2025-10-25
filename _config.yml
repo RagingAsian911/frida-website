@@ -35,3 +35,11 @@ plugins:
   - jekyll-avatar
   - jekyll-gist
   - jekyll-multiple-languages-plugin
+- name: Configure AWS credentials
+  uses: aws-actions/configure-aws-credentials@v1
+  with:
+    aws-access-key-id: ${{ secrets.S3_ACCESS_KEY }}
+    aws-secret-access-key: ${{ secrets.S3_SECRET_KEY }}
+    aws-region: us-east-1
+env:
+  ACTIONS_STEP_DEBUG: true
