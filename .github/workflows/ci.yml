@@ -69,4 +69,10 @@ jobs:
           name: site
           path: _site/
       - name: Deploy site
-        run: _releng/deploy.py
+        run: _releng/deploy.py  
+git checkout -b main-production
+git checkout -b dev
+git checkout -b sandbox
+git push -u origin main-production
+git push -u origin dev
+git push -u origin sandbox
